@@ -2,17 +2,28 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using replace_tool;
+using System.Net;
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
-string fileName = "ClientApp\\src\\components\\trialBalance\\fileUpload\\uploadFile.js";
+string fileName = "ClientApp\\src\\validators\\index.js";
 
 string path = "C:\\Users\\Admin\\source\\repos\\FR\\AuvCommercial.Application\\FrontEnd\\";
 string filePath = Path.Combine(path, fileName);
 
+string metaFileName = "7.0_en_meta_v1";
+string metaPath = $"C:\\Users\\Admin\\Desktop\\duplicate\\{metaFileName}.json";
+
+string logFileName = $"keys_not_found_in_meta_pool_{metaFileName}";
+string logPath = $"C:\\Users\\Admin\\Desktop\\duplicate\\{logFileName}.json";
+
 string keyword = "window.localize.lang";
 
 var source = File.ReadAllText(filePath);
+var metaPool = JsonConvert.DeserializeObject<JObject>(File.ReadAllText(metaPath));
+
+source = CleanUp(source, keyword);
 
 #region For Non-Assignment
 
@@ -31,8 +42,22 @@ foreach (var line in lines)
     foreach (var item in temp)
     {
         string rightParameter = StandardizeRightParameter(item, keyword);
+        var forReplace = rightParameter;
+        if (metaPool.ContainsKey(rightParameter))
+        {
+            rightParameter = metaPool[rightParameter].ToString();
+        }
+        else
+        {
+            string message = $"Key not found: {rightParameter}, split_item: {item}, original: {line.Original}";
 
-        var res = line.Original.Replace(CombileString(keyword, rightParameter), keyword + $"[\"{rightParameter}\"]") ;
+            LogNotFoundKey(logPath, rightParameter, message);
+
+            Console.WriteLine(message);
+
+        }
+
+        var res = line.Original.Replace(CombileString(keyword, forReplace), keyword + $"[\"{rightParameter}\"]") ;
 
         nonAssignmentResult.Add(new ParameterGroup
         {
@@ -53,14 +78,10 @@ foreach (var item in nonAssignmentResult)
 #region For Assignment
 var parameterGroups = new List<ParameterGroup>();
 
-var group = CrawlLineDataForAssignment(source, keyword).Select(s =>
-{
-    var temp = s.Original.Split("=");
-    return new ParameterGroup { Ref = s, LeftParameter = StandardizeLeftParameter(temp[0], keyword), RightParameter = StandardizeRightParameter(temp[1], keyword) };
-})
-.GroupBy(g => g.LeftParameter);
+var group = HandleBaseData(source, keyword);
+var grLeft = group.GroupBy(g => g.LeftParameter);
 
-foreach (var item in group)
+foreach (var item in grLeft)
 {
     ParameterGroup keep = item.FirstOrDefault();
 
@@ -69,27 +90,129 @@ foreach (var item in group)
 
     if (keep != null)
     {
-        keep.LeftItems = LookupRefParameter(source, keep);
+        keep.LeftItems = LookupRefParameter(source, keep, metaPool, logPath);
         parameterGroups.Add(keep);
     }
 }
 
-foreach (var item in parameterGroups)
+foreach (var _item in parameterGroups.GroupBy(s => s.IsBlush))
 {
-    var jObj = BuildObject(item.LeftItems, keyword);
+    if (_item.Key)
+    {
+        
+        var orgGr = _item.ToList().GroupBy(g => g.Ref.Original);
+        foreach (var gr in orgGr)
+        {
+            var grResult = string.Empty;
 
-    item.Result += $"{item.LeftParameter} = " +
-                    JsonConvert.SerializeObject(jObj, Formatting.Indented)
-                               .Replace("\"", string.Empty)
-                               .Replace("\\", "\"");
+            foreach (var item in gr)
+            {
+                var jObj = BuildObject(item.LeftItems, keyword);
+                if (jObj.HasValues)
+                {
+                    item.Result += $"{item.LeftParameter} = " +
+                                JsonConvert.SerializeObject(jObj, Formatting.Indented)
+                                           .Replace("\"", string.Empty)
+                                           .Replace("\\", "\"");
+                    grResult += item.Result + "\n";
+                }
+                else
+                    item.Result = string.Empty;
 
-    source = Regex.Replace(source, "(" + item.LeftParameter + ")(.[ ]*)(?==)(.[ ]*)(" + CombileString(keyword, item.RightParameter) + ")", item.Result);
+            }
+
+            source = source.Replace(gr.Key, grResult);
+        }
+    }
+    else
+    {
+        foreach (var item in _item)
+        {
+            var jObj = BuildObject(item.LeftItems, keyword);
+            if (jObj.HasValues)
+            {
+                item.Result += $"{item.LeftParameter} = " +
+                            JsonConvert.SerializeObject(jObj, Formatting.Indented)
+                                       .Replace("\"", string.Empty)
+                                       .Replace("\\", "\"");
+
+                source = Regex.Replace(source, "(" + item.LeftParameter + ")(.[ ]*)(?==)(.[ ]*)(" + CombileString(keyword, item.RightParameter) + ")", item.Result);
+            }
+            else
+                source = source.Replace(item.Ref.Original, string.Empty);
+        }
+    }
 }
 #endregion
 
 File.WriteAllText(filePath, source);
 Console.WriteLine("All ok");
 
+
+static string CleanUp(string source, string keyword)
+{
+    var grLeft = HandleBaseData(source, keyword).GroupBy(g => g.LeftParameter);
+
+    foreach (var item in grLeft)
+    {
+        var temp = item.OrderByDescending(o => o.Ref.OriginalIndex).FirstOrDefault();
+
+        var leftParameter = item.Key.Replace("const", string.Empty).Replace(" ", string.Empty);
+        string pattern = @"(?<==|:)([ ]*)(" + leftParameter + ")";
+
+        if (Regex.Matches(source, pattern).Count() > 0)
+        {
+            source = Regex.Replace(source, pattern, $" {CombileString(keyword, temp.RightParameter)}");
+        }
+    }
+
+    var needNext = HandleBaseData(source, keyword).GroupBy(g => g.LeftParameter).Any(item =>
+    {
+        var temp = item.OrderByDescending(o => o.Ref.OriginalIndex).FirstOrDefault();
+
+        var leftParameter = item.Key.Replace("const", string.Empty).Replace(" ", string.Empty);
+        string pattern = @"(?<==|:)([ ]*)(" + leftParameter + ")";
+
+        return Regex.Matches(source, pattern).Count() > 0;
+    });
+
+    if (needNext)
+        source = CleanUp(source, keyword);
+
+    return source;
+}
+
+static List<ParameterGroup> HandleBaseData(string source, string keyword)
+{
+    var group = new List<ParameterGroup>();
+
+    foreach (var s in CrawlLineDataForAssignment(source, keyword))
+    {
+        var split = s.Original.Split("=");
+        if (split.Length > 0 && split.Length <= 2)
+        {
+            var div = Regex.Match(split[0].Trim(), @"({)(.[a-zA-Z0-9_, ]*)(})");
+            if (div != null && div.Success)
+            {
+                var paras = div.Value.Replace("{", string.Empty)
+                                 .Replace("}", string.Empty)
+                                 .Split(",");
+
+                foreach (var item in paras)
+                {
+                    var stdLeft = StandardizeLeftParameter(item, keyword);
+
+                    if (!string.IsNullOrWhiteSpace(stdLeft))
+                        group.Add(new ParameterGroup { IsBlush = true, Ref = s, LeftParameter = $"const {stdLeft}", RightParameter = CombileString(StandardizeRightParameter(split[1], keyword), stdLeft) });
+                }
+            }
+            else
+                group.Add(new ParameterGroup { Ref = s, LeftParameter = StandardizeLeftParameter(split[0], keyword), RightParameter = StandardizeRightParameter(split[1], keyword) });
+        }
+    }
+
+    return group;
+}
 
 
 static JObject BuildObject(List<RefParameterItem> flatItems, string keyword)
@@ -132,7 +255,7 @@ static JObject BuildJObject(JObject result, List<ChildBuildItem> item, int max, 
 
     if (isLast)
     {
-        result[ch.Origin] = keyword + $"[\"{ch.Parent.Combined}\"]";
+        result[ch.Origin] = keyword + $"[\"{ch.Parent.SelectedKey}\"]";
     }
     else
     {
@@ -140,7 +263,7 @@ static JObject BuildJObject(JObject result, List<ChildBuildItem> item, int max, 
 
         if (!result.ContainsKey(ch.Origin))
             result[ch.Origin] = new JObject();
-
+        
         var next = BuildJObject(result[ch.Origin].ToObject<JObject>(), item, max, i, keyword);
         result[ch.Origin] = next;
     }
@@ -207,32 +330,44 @@ static string StandardizeLeftParameter(string source, string keyword)
     return temp;
 }
 
-static List<RefParameterItem> LookupRefParameter(string source, ParameterGroup Parent)
+static List<RefParameterItem> LookupRefParameter(string source, ParameterGroup Parent, JObject metaPool, string logPath)
 {
     var list = new List<RefParameterItem>();
-    var parent = Regex.Matches(source, @"(?<=" + Parent.LeftParameter + "\\.)(.*)(?=\n)").ToList();
+    var leftParameter = Parent.LeftParameter.Replace("const", string.Empty).Replace(" ", string.Empty);
+    var parent = Regex.Matches(source, @"(?<=" + leftParameter + "\\.)(.*)(?=\n)").ToList();
 
     foreach (var item in parent)
     {
         var cooked = LookupRefCore(item);
+        var buildKey = CombileString(Parent.RightParameter, cooked);
+        var selectedKey = buildKey;
+        if (metaPool.ContainsKey(buildKey))
+            selectedKey = metaPool[buildKey].ToString();
+        else
+        {
+            string message = $"Key not found: {buildKey}, parameter: {Parent.LeftParameter}, original: {item.Value}, cooked: {cooked}";            
+            LogNotFoundKey(logPath, buildKey, message);
+            Console.WriteLine(message);
+        }
 
         list.Add(new RefParameterItem
         {
             OriginalIndex = item.Index,
             Original = item.Value,
             Cooked = cooked,
-            Combined = CombileString(Parent.RightParameter, cooked),
-            Parent = Parent
+            BuildKey = CombileString(Parent.RightParameter, cooked),
+            Parent = Parent,
+            SelectedKey = selectedKey
         });
 
         // loop
-        if (item.Value.Contains(Parent.LeftParameter))
+        if (item.Value.Contains(leftParameter))
         {
             string nextSource = item.Value;
             if (!nextSource.EndsWith("\n"))
                 nextSource = nextSource + "\n";
 
-            list.AddRange(LookupRefParameter(nextSource, Parent));
+            list.AddRange(LookupRefParameter(nextSource, Parent, metaPool, logPath));
         }
     }
 
@@ -272,4 +407,20 @@ static string CombileString(string left, string right, string separator = ".")
         lst.Add(right);
 
     return string.Join(separator, lst.ToArray());
+}
+
+static void LogNotFoundKey(string logPath, string key, string message)
+{
+    if (!File.Exists(logPath))
+    {
+        File.Create(logPath).Close();
+        File.WriteAllText(logPath, JsonConvert.SerializeObject(new JObject()));
+    }
+    var logs = JsonConvert.DeserializeObject<JObject>(File.ReadAllText(logPath));
+    if (!logs.ContainsKey(key))
+        logs.Add(key, message);
+    else
+        logs[key] += message + "\n";
+
+    File.WriteAllText(logPath, JsonConvert.SerializeObject(logs));
 }

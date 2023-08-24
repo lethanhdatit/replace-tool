@@ -17,7 +17,8 @@ namespace replace_tool
         public string Original { get; set; }
         public long OriginalIndex { get; set; }
         public string Cooked { get; set; }
-        public string Combined { get; set; }
+        public string BuildKey { get; set; }
+        public string SelectedKey { get; set; }
         public ParameterGroup Parent { get; set; }
         public ObjectBuildItem Object { get; set; }
     }
@@ -29,6 +30,7 @@ namespace replace_tool
         public List<RefParameterItem> LeftItems { get; set; }
         public string RightParameter { get; set; }
         public string Result { get; set; }
+        public bool IsBlush { get; set; }
     }
 
     public class ObjectBuildItem
